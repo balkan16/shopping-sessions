@@ -255,10 +255,17 @@ log("events cleaned")
 con.execute(f"""
 CREATE TABLE ev_s AS
 WITH g AS (
-  SELECT *, CASE WHEN ts - lag(ts) OVER w > 1800000 OR lag(ts) OVER w IS NULL THEN 1 ELSE 0 END AS new_s
-  FROM ev_clean WINDOW w AS (PARTITION BY person ORDER BY ts)
+  -- Gap to the previous DISTINCT timestamp, so every event sharing a ts gets the same flag
+  -- regardless of the order ties are read in.
+  SELECT *, max(ts) OVER (PARTITION BY person ORDER BY ts
+                          RANGE BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING) AS prev_ts
+  FROM ev_clean
 )
-SELECT *, sum(new_s) OVER (PARTITION BY person ORDER BY ts ROWS UNBOUNDED PRECEDING) AS sid FROM g
+SELECT person, ts, is_purchase, price, category,
+       -- session id = its start ts; the frame includes all peers, so ties always agree
+       max(CASE WHEN prev_ts IS NULL OR ts - prev_ts > 1800000 THEN ts END)
+         OVER (PARTITION BY person ORDER BY ts RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS sid
+FROM g
 """)
 con.execute("""
 CREATE TABLE sessions AS
@@ -311,7 +318,10 @@ CREATE TABLE assist_iv AS
 WITH c AS (
   SELECT person, campaign_id, ts,
          CASE WHEN ts - lag(ts) OVER w > {WEEK} OR lag(ts) OVER w IS NULL THEN 1 ELSE 0 END AS new_g
-  FROM clicks WINDOW w AS (PARTITION BY person, campaign_id ORDER BY ts)
+  -- DISTINCT first: equal timestamps would otherwise make the two windows below order ties
+  -- differently and split one interval into two overlapping ones (double-counted assists).
+  FROM (SELECT DISTINCT person, campaign_id, ts FROM clicks)
+  WINDOW w AS (PARTITION BY person, campaign_id ORDER BY ts)
 ), g AS (
   SELECT *, sum(new_g) OVER (PARTITION BY person, campaign_id ORDER BY ts ROWS UNBOUNDED PRECEDING) AS gid FROM c
 )
@@ -373,3 +383,8 @@ COPY (
 ) TO '{os.path.join(OUT, "campaign_daily", "part-0.parquet")}' (FORMAT parquet)
 """)
 log("done")
+
+# Skip interpreter/DuckDB teardown: outputs are already flushed and closed.
+sys.stdout.flush()
+sys.stderr.flush()
+os._exit(0)
