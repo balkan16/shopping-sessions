@@ -3,3 +3,4 @@ dev/
 dev-answer/
 __pycache__/
 .DS_Store
+rust/target/

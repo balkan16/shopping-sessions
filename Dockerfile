@@ -1,23 +1,16 @@
-# Shopping Sessions starter: DuckDB skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
-FROM python:3.12-slim-bookworm
+# Shopping Sessions: Rust pipeline (v4).
+# Build stage: compile the binary (network is available during the build).
+FROM rust:1-slim-bookworm AS build
+WORKDIR /src
+COPY rust/Cargo.toml rust/Cargo.lock ./
+COPY rust/src ./src
+RUN cargo build --release --locked
 
-# The scorer runs the container as uid 1000; give that uid a name and a home.
+# Run stage: just the binary. The scorer runs it as uid 1000 with a read-only root,
+# /data read-only and /output, /scratch writable.
+FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY run.sh /app/run.sh
-RUN chmod -R a+rX /app && chmod 755 /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
+COPY --from=build /src/target/release/shopping-sessions /app/shopping-sessions
+RUN chmod 755 /app/shopping-sessions
 WORKDIR /app
-CMD ["/app/run.sh"]
+CMD ["/app/shopping-sessions"]
