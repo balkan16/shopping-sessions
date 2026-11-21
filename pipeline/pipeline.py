@@ -206,41 +206,45 @@ log(f"links: {n_ids} ids")
 # ---------------------------------------------------------------------------
 # Events.
 # ---------------------------------------------------------------------------
-EV_COLS = ["event_id", "user_id", "ts", "ingest_ts", "event_type", "product_id", "price_cents"]
+
 con.execute(f"""
-CREATE TABLE ev_parsed AS
-SELECT uq(f.event_id) AS event_id, uq(f.user_id) AS user_id, uq(f.ts) AS ts,
-       uq(f.ingest_ts) AS ingest_ts, uq(f.event_type) AS event_type,
-       uq(f.product_id) AS product_id, uq(f.price_cents) AS price_cents
-FROM (SELECT {fields(EV_COLS)} AS f FROM ev_lines
+CREATE TABLE ev_str AS
+SELECT uq(x[1]) AS event_id, uq(x[2]) AS user_id, uq(x[3]) AS ts, uq(x[4]) AS ingest_ts,
+       uq(x[5]) AS event_type, uq(x[6]) AS product_id, uq(x[7]) AS price_cents
+FROM (SELECT string_split(line, ',') AS x FROM ev_lines
       WHERE line IS NOT NULL AND regexp_full_match(line, '{line_re(7)}'))
-WHERE uq(f.event_id) IS NOT NULL
+WHERE uq(x[1]) IS NOT NULL
 """)
-log("events parsed")
+log("events split")
+# One row per event_id: the copy with the smallest ingest_ts (copies with equal ingest_ts are identical).
+con.execute("""
+CREATE TABLE ev_dedup AS
+SELECT unnest(r) FROM (
+  SELECT arg_min({'user_id': user_id, 'ts': ts, 'it': epoch_ms(strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ')),
+                  'event_type': event_type, 'product_id': product_id, 'price_cents': price_cents},
+                 ingest_ts) AS r
+  FROM ev_str GROUP BY event_id)
+""")
+con.execute("DROP TABLE ev_str")
+log("events deduped")
+con.execute(f"""
+CREATE TABLE ev_valid AS
+SELECT user_id, ts_ms(ts) AS t, it, event_type = 'purchase' AS is_purchase,
+       CASE WHEN event_type = 'purchase' THEN price_cents END AS price_s, product_id
+FROM ev_dedup
+WHERE user_id IS NOT NULL AND product_id IS NOT NULL AND event_type IN ('view', 'cart', 'purchase')
+""")
 con.execute(f"""
 CREATE TABLE ev_clean AS
-WITH dedup AS (
-  SELECT * FROM ev_parsed
-  QUALIFY row_number() OVER (PARTITION BY event_id ORDER BY ingest_ts) = 1
-), v AS (
-  SELECT user_id, ts_ms(ts) AS t,
-         epoch_ms(strptime(ingest_ts, '%Y-%m-%dT%H:%M:%SZ')) AS it,
-         event_type, product_id,
-         CASE WHEN event_type = 'purchase' THEN price_cents END AS price_s
-  FROM dedup
-  WHERE user_id IS NOT NULL AND product_id IS NOT NULL
-    AND event_type IN ('view', 'cart', 'purchase')
-)
-SELECT coalesce(m.person, v.user_id) AS person, v.t AS ts,
-       v.event_type = 'purchase' AS is_purchase,
-       CASE WHEN v.event_type = 'purchase' THEN TRY_CAST(ltrim(v.price_s, '0') AS BIGINT) ELSE 0 END AS price,
+SELECT coalesce(m.person, v.user_id) AS person, v.t AS ts, v.is_purchase,
+       CASE WHEN v.is_purchase THEN TRY_CAST(ltrim(v.price_s, '0') AS BIGINT) ELSE 0 END AS price,
        coalesce(p.category, 'unknown') AS category
-FROM v
+FROM ev_valid v
 LEFT JOIN idmap m ON m.id = v.user_id
 LEFT JOIN products p ON p.product_id = v.product_id
-WHERE v.t IS NOT NULL AND v.t >= {WS} AND v.t < {WE}
+WHERE v.t >= {WS} AND v.t < {WE}
   AND v.it - v.t <= {DAY}
-  AND (v.event_type <> 'purchase' OR (
+  AND (NOT v.is_purchase OR (
         v.price_s IS NOT NULL AND regexp_full_match(v.price_s, '[0-9]+')
         AND length(ltrim(v.price_s, '0')) BETWEEN 1 AND 8
         AND TRY_CAST(ltrim(v.price_s, '0') AS BIGINT) BETWEEN 1 AND 10000000))
@@ -267,24 +271,25 @@ log("sessions built")
 # ---------------------------------------------------------------------------
 # Clicks.
 # ---------------------------------------------------------------------------
-CK_COLS = ["click_id", "user_id", "campaign_id", "ts"]
+con.execute(f"""
+CREATE TABLE ck_str AS
+SELECT uq(x[1]) AS click_id, uq(x[2]) AS user_id, uq(x[3]) AS campaign_id, uq(x[4]) AS ts
+FROM (SELECT string_split(line, ',') AS x FROM ck_lines
+      WHERE line IS NOT NULL AND regexp_full_match(line, '{line_re(4)}'))
+WHERE uq(x[1]) IS NOT NULL
+""")
 con.execute(f"""
 CREATE TABLE clicks AS
-WITH p AS (
-  SELECT uq(f.click_id) AS click_id, uq(f.user_id) AS user_id,
-         uq(f.campaign_id) AS campaign_id, uq(f.ts) AS ts
-  FROM (SELECT {fields(CK_COLS)} AS f FROM ck_lines
-        WHERE line IS NOT NULL AND regexp_full_match(line, '{line_re(4)}'))
-  WHERE uq(f.click_id) IS NOT NULL
-), d AS (
-  SELECT DISTINCT ON (click_id) * FROM p
+WITH d AS (
+  SELECT click_id, any_value(user_id) AS user_id, any_value(campaign_id) AS campaign_id, any_value(ts) AS ts
+  FROM ck_str GROUP BY click_id
 ), v AS (
   SELECT click_id, user_id, campaign_id, ts_ms(ts) AS t FROM d
   WHERE user_id IS NOT NULL AND campaign_id IN (SELECT campaign_id FROM campaigns)
 )
 SELECT coalesce(m.person, v.user_id) AS person, v.click_id, v.campaign_id, v.t AS ts
 FROM v LEFT JOIN idmap m ON m.id = v.user_id
-WHERE v.t IS NOT NULL AND v.t >= {CWS} AND v.t < {WE}
+WHERE v.t >= {CWS} AND v.t < {WE}
 """)
 log("clicks cleaned")
 

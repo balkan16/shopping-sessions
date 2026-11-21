@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY pipeline/ /app/pipeline/
 COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
+RUN chmod -R a+rX /app && chmod 755 /app/run.sh
 
 # At run time the root filesystem is read-only, the user is 1000:1000, there is
 # no network, /data is read-only, and /output and /scratch are the only writable
